@@ -136,66 +136,16 @@ internal class ResourceWatcher<TEntity>(
         {
             try
             {
-                await foreach ((WatchEventType type, TEntity entity) in client.WatchAsync<TEntity>(
-                                   settings.Namespace,
-                                   resourceVersion: currentVersion,
-                                   allowWatchBookmarks: true,
-                                   cancellationToken: stoppingToken))
-                {
-#pragma warning disable SA1312
-                    using var _ = logger.BeginScope(new
-#pragma warning restore SA1312
-                    {
-                        EventType = type,
+                var watchResult = client.WatchAsync<TEntity>(
+                    settings.Namespace,
+                    resourceVersion: currentVersion,
+                    allowWatchBookmarks: false,
+                    cancellationToken: stoppingToken);
 
-                        // ReSharper disable once RedundantAnonymousTypePropertyName
-                        Kind = entity.Kind,
-                        Name = entity.Name(),
-                        ResourceVersion = entity.ResourceVersion(),
-                    });
-                    logger.LogInformation(
-                        """Received watch event "{EventType}" for "{Kind}/{Name}", last observed resource version: {ResourceVersion}.""",
-                        type,
-                        entity.Kind,
-                        entity.Name(),
-                        entity.ResourceVersion());
-
-                    if (type == WatchEventType.Bookmark)
-                    {
-                        currentVersion = entity.ResourceVersion();
-                        continue;
-                    }
-
-                    try
-                    {
-                        await OnEventAsync(type, entity, stoppingToken);
-                    }
-                    catch (KubernetesException e)
-                    {
-                        if (e.Status.Code is (int)HttpStatusCode.Gone or (int)HttpStatusCode.GatewayTimeout)
-                        {
-                            logger.LogDebug(e, "Watch restarting due to 410 HTTP Gone or 504 Gateway Timeout.");
-
-                            break;
-                        }
-
-                        LogReconciliationFailed(e);
-                    }
-                    catch (Exception e)
-                    {
-                        LogReconciliationFailed(e);
-                    }
-
-                    void LogReconciliationFailed(Exception exception)
-                    {
-                        logger.LogError(
-                            exception,
-                            "Reconciliation of {EventType} for {Kind}/{Name} failed.",
-                            type,
-                            entity.Kind,
-                            entity.Name());
-                    }
-                }
+                await Parallel.ForEachAsync(
+                    watchResult,
+                    stoppingToken,
+                    ProcessEntityAsync);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -215,6 +165,57 @@ internal class ResourceWatcher<TEntity>(
             logger.LogInformation(
                 "Watcher for {ResourceType} was terminated and is reconnecting.",
                 typeof(TEntity).Name);
+        }
+    }
+
+    private async ValueTask ProcessEntityAsync((WatchEventType EventType, TEntity Entity) typeAndEntity, CancellationToken cancellationToken)
+    {
+        var type = typeAndEntity.EventType;
+        var entity = typeAndEntity.Entity;
+#pragma warning disable SA1312
+        using var _ = logger.BeginScope(new
+#pragma warning restore SA1312
+        {
+            EventType = type,
+
+            // ReSharper disable once RedundantAnonymousTypePropertyName
+            Kind = entity.Kind,
+            Name = entity.Name(),
+            ResourceVersion = entity.ResourceVersion(),
+        });
+        logger.LogInformation(
+            """Received watch event "{EventType}" for "{Kind}/{Name}", last observed resource version: {ResourceVersion}.""",
+            type,
+            entity.Kind,
+            entity.Name(),
+            entity.ResourceVersion());
+
+        try
+        {
+            await OnEventAsync(type, entity, cancellationToken);
+        }
+        catch (KubernetesException e)
+        {
+            if (e.Status.Code is (int)HttpStatusCode.Gone or (int)HttpStatusCode.GatewayTimeout)
+            {
+                logger.LogDebug(e, "Watch restarting due to 410 HTTP Gone or 504 Gateway Timeout.");
+            }
+
+            LogReconciliationFailed(e);
+        }
+        catch (Exception e)
+        {
+            LogReconciliationFailed(e);
+        }
+
+        void LogReconciliationFailed(Exception exception)
+        {
+            logger.LogError(
+                exception,
+                "Reconciliation of {EventType} for {Kind}/{Name} failed.",
+                type,
+                entity.Kind,
+                entity.Name());
         }
     }
 
